@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>In-App AI Agent</title>
+<style>
+  :root { --bg:#0f1115; --panel:#171a21; --line:#262b36; --text:#e6e8ee; --muted:#8b93a7; --accent:#6ea8fe; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:15px/1.5 system-ui, sans-serif; background:var(--bg); color:var(--text); }
+  header { padding:14px 20px; border-bottom:1px solid var(--line); display:flex; gap:16px; align-items:baseline; }
+  header h1 { font-size:17px; margin:0; }
+  header span { color:var(--muted); font-size:13px; }
+  main { display:grid; grid-template-columns: 1fr 1fr; gap:16px; padding:16px; height:calc(100vh - 56px); }
+  section { background:var(--panel); border:1px solid var(--line); border-radius:10px; display:flex; flex-direction:column; min-height:0; }
+  section h2 { font-size:14px; margin:0; padding:10px 14px; border-bottom:1px solid var(--line); color:var(--muted); font-weight:600; }
+  #log { flex:1; overflow:auto; padding:14px; }
+  .msg { margin:0 0 12px; white-space:pre-wrap; }
+  .msg b { color:var(--accent); font-weight:600; }
+  .meta { color:var(--muted); font-size:12px; }
+  form { display:flex; gap:8px; padding:10px; border-top:1px solid var(--line); }
+  textarea, select, input { background:var(--bg); color:var(--text); border:1px solid var(--line); border-radius:6px; padding:8px; font:inherit; }
+  textarea { flex:1; resize:vertical; }
+  button { background:var(--accent); color:#0b0d12; border:0; border-radius:6px; padding:8px 14px; font-weight:600; cursor:pointer; }
+  button.secondary { background:transparent; color:var(--muted); border:1px solid var(--line); }
+  button:disabled { opacity:.5; cursor:wait; }
+  #analyze { padding:10px; display:flex; flex-direction:column; gap:8px; flex:1; min-height:0; }
+  #analyze textarea { flex:1; }
+  #result { padding:14px; border-top:1px solid var(--line); white-space:pre-wrap; min-height:120px; overflow:auto; }
+  @media (max-width: 900px) { main { grid-template-columns:1fr; height:auto; } section { min-height:420px; } }
+</style>
+</head>
+<body>
+<header><h1>In-App AI Agent</h1><span id="info">memuat info model...</span></header>
+<main>
+  <section>
+    <h2>Chat (streaming, dengan memori sesi)</h2>
+    <div id="log"></div>
+    <form id="chatForm">
+      <textarea id="message" rows="2" placeholder="Tulis pesan... (Enter untuk kirim, Shift+Enter baris baru)"></textarea>
+      <button id="send">Kirim</button>
+      <button type="button" class="secondary" id="reset">Reset</button>
+    </form>
+  </section>
+  <section>
+    <h2>Analisis Teks</h2>
+    <form id="analyze">
+      <select id="task"></select>
+      <textarea id="text" placeholder="Tempel teks yang ingin dianalisis..."></textarea>
+      <button id="analyzeBtn">Analisis</button>
+    </form>
+    <div id="result" class="meta">Hasil akan muncul di sini.</div>
+  </section>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+let sessionId = sessionStorage.getItem('sessionId') || '';
+
+fetch('/api/info').then(r => r.json()).then(i => {
+  $('info').textContent = `${i.model} - ${i.backend} - context ${i.maxTokens} token`;
+  $('task').innerHTML = i.tasks.map(t => `<option>${t}</option>`).join('');
+});
+
+function addMsg(who, text) {
+  const p = document.createElement('p');
+  p.className = 'msg';
+  p.innerHTML = `<b>${who}</b>\n`;
+  const body = document.createElement('span');
+  body.textContent = text;
+  p.appendChild(body);
+  $('log').appendChild(p);
+  $('log').scrollTop = $('log').scrollHeight;
+  return p;
+}
+
+// Minimal SSE-over-POST reader (EventSource only supports GET).
+async function streamChat(message, onEvent) {
+  const res = await fetch('/api/chat/stream', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Accept': 'text/event-stream' },
+    body: JSON.stringify({ sessionId, message })
+  });
+  if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = '';
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    let idx;
+    while ((idx = buf.indexOf('\n\n')) >= 0) {
+      const raw = buf.slice(0, idx); buf = buf.slice(idx + 2);
+      let event = 'message', data = [];
+      for (const line of raw.split('\n')) {
+        if (line.startsWith('event:')) event = line.slice(6).trim();
+        else if (line.startsWith('data:')) data.push(line.slice(5).replace(/^ /, ''));
+      }
+      onEvent(event, data.join('\n'));
+    }
+  }
+}
+
+$('chatForm').addEventListener('submit', async e => {
+  e.preventDefault();
+  const message = $('message').value.trim();
+  if (!message) return;
+  $('message').value = '';
+  $('send').disabled = true;
+  addMsg('Anda', message);
+  const p = addMsg('AI', '');
+  const body = p.querySelector('span');
+  // Status line: queue position + elapsed time until the first token, so a slow model never looks dead.
+  const status = document.createElement('span');
+  status.className = 'meta';
+  p.appendChild(status);
+  const started = Date.now();
+  let ahead = 0, gotToken = false, finished = false;
+  const tick = setInterval(() => {
+    const s = Math.round((Date.now() - started) / 1000);
+    status.textContent = ahead > 0 ? `menunggu antrean (${ahead} permintaan di depan)... ${s} s` : `memproses prompt... ${s} s`;
+  }, 500);
+  const stopStatus = () => { clearInterval(tick); status.remove(); };
+  try {
+    await streamChat(message, (event, data) => {
+      if (event === 'session') { sessionId = data; sessionStorage.setItem('sessionId', data); }
+      else if (event === 'queued') { ahead = Number(data); }
+      else if (event === 'token') {
+        if (!gotToken) { gotToken = true; stopStatus(); }
+        body.textContent += data; $('log').scrollTop = $('log').scrollHeight;
+      }
+      else if (event === 'done') {
+        finished = true; stopStatus();
+        const d = JSON.parse(data);
+        p.insertAdjacentHTML('beforeend', `\n<span class="meta">${(d.elapsedMs / 1000).toFixed(1)} s - ${d.chunks} token - ${(d.chunks / (d.elapsedMs / 1000)).toFixed(1)} tok/s</span>`);
+      }
+      else if (event === 'error') { finished = true; stopStatus(); body.textContent += `\n[error] ${data}`; }
+    });
+    if (!finished) body.textContent += '\n[error] koneksi terputus sebelum jawaban selesai';
+  } catch (err) {
+    body.textContent += `\n[error] ${err.message}`;
+  } finally {
+    stopStatus();
+    $('send').disabled = false;
+    $('message').focus();
+  }
+});
+
+$('message').addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); $('chatForm').requestSubmit(); }
+});
+
+$('reset').addEventListener('click', async () => {
+  if (sessionId) await fetch(`/api/chat/${encodeURIComponent(sessionId)}`, { method: 'DELETE' });
+  sessionId = ''; sessionStorage.removeItem('sessionId'); $('log').innerHTML = '';
+});
+
+$('analyze').addEventListener('submit', async e => {
+  e.preventDefault();
+  const text = $('text').value.trim();
+  if (!text) return;
+  $('analyzeBtn').disabled = true;
+  $('result').textContent = 'Menganalisis...';
+  try {
+    const res = await fetch('/api/analyze', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ task: $('task').value, text })
+    });
+    const j = await res.json();
+    $('result').textContent = res.ok ? `${j.result}\n\n(${(j.elapsedMs / 1000).toFixed(1)} s)` : `[error] ${j.detail || res.statusText}`;
+  } catch (err) {
+    $('result').textContent = `[error] ${err.message}`;
+  } finally {
+    $('analyzeBtn').disabled = false;
+  }
+});
+</script>
+</body>
+</html>

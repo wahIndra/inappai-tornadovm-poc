@@ -1,0 +1,9 @@
+target/
+.tools/
+models/
+*.gguf
+.idea/
+*.iml
+.vscode/
+.claude/settings.local.json
+.claude/.headroom_wrap_marker.json
